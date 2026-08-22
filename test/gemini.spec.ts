@@ -27,6 +27,7 @@ import {
   geminiThinks,
   isGeminiPermanentRefreshError,
   refreshGemini,
+  setupGeminiProject,
 } from '../src/providers/gemini.js'
 import type { GeminiSession } from '../src/auth/store.js'
 import { OAuthEndpointError, TokenManager } from '../src/providers/common.js'
@@ -106,10 +107,13 @@ interface SeenRequest {
 
 /**
  * Replace global fetch with a URL-routed fake. Routes map a URL to the JSON
- * payload it answers; unlisted URLs 404. Returns the request log and the
- * restore function.
+ * payload it answers, or to a function called per request when the answer has
+ * to change between calls (polling); unlisted URLs 404. Returns the request
+ * log and the restore function.
  */
-function fakeRoutes(routes: Record<string, unknown>): { seen: SeenRequest[]; restore: () => void } {
+function fakeRoutes(
+  routes: Record<string, unknown | (() => unknown)>,
+): { seen: SeenRequest[]; restore: () => void } {
   const real = globalThis.fetch
   const seen: SeenRequest[] = []
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -120,7 +124,8 @@ function fakeRoutes(routes: Record<string, unknown>): { seen: SeenRequest[]; res
       body: typeof init?.body === 'string' ? init.body : undefined,
     })
     if (!(url in routes)) return new Response('not found', { status: 404 })
-    return Response.json(routes[url])
+    const route = routes[url]
+    return Response.json(typeof route === 'function' ? (route as () => unknown)() : route)
   }) as typeof fetch
   return { seen, restore: () => { globalThis.fetch = real } }
 }
@@ -135,6 +140,7 @@ test('exchangeGeminiCode: token grant, currentTier setup, and email lookup', asy
       currentTier: { id: 'free-tier', name: 'Gemini Code Assist for individuals' },
       cloudaicompanionProject: 'managed-project-1',
     },
+    [ONBOARD_USER_URL]: { done: true, response: { cloudaicompanionProject: { id: 'managed-project-1' } } },
     [GEMINI_USERINFO_URL]: { email: 'user@example.com' },
   })
   try {
@@ -190,38 +196,104 @@ test('exchangeGeminiCode: a new account onboards onto the default tier', async (
   }
 })
 
-test('exchangeGeminiCode: onboarding polls the long-running operation', async () => {
-  const operationUrl = `${CODE_ASSIST_ENDPOINT}/v1internal/operations/op-1`
+test('setupGeminiProject: onboarding is re-issued until the operation reports done', async () => {
+  let calls = 0
   const fake = fakeRoutes({
-    [GEMINI_TOKEN_URL]: { access_token: 'gem-at', refresh_token: 'gem-rt', expires_in: 3600 },
     [LOAD_CODE_ASSIST_URL]: { currentTier: null, allowedTiers: [] },
-    [ONBOARD_USER_URL]: { done: false, name: 'operations/op-1' },
-    [operationUrl]: { done: true, response: { cloudaicompanionProject: { id: 'provisioned-2' } } },
-    [GEMINI_USERINFO_URL]: {},
+    // onboardUser IS the poll: there is no operations endpoint to GET, so the
+    // same call is repeated until it settles.
+    [ONBOARD_USER_URL]: () => {
+      calls += 1
+      return calls < 3 ? { done: false } : { done: true, response: { cloudaicompanionProject: { id: 'provisioned-2' } } }
+    },
   })
   try {
-    const session = await exchangeGeminiCode('the-code', 'the-verifier', 'http://127.0.0.1:1/oauth2callback')
-    assert.equal(session.projectId, 'provisioned-2')
-    assert.equal(session.tier, 'legacy-tier', 'no default tier falls back to legacy-tier')
-    assert.ok(fake.seen.some(request => request.url === operationUrl), 'the operation was polled')
-    assert.equal(session.emailAddress, undefined, 'a userinfo miss is decorative, not fatal')
+    const setup = await setupGeminiProject('gem-at', 1)
+    assert.equal(setup.projectId, 'provisioned-2')
+    assert.equal(setup.tier, 'legacy-tier', 'no default tier falls back to legacy-tier')
+    assert.equal(calls, 3, 'onboardUser was re-issued until done')
+    assert.equal(
+      fake.seen.filter(request => request.url === ONBOARD_USER_URL).length, 3,
+      'every poll went to onboardUser',
+    )
   } finally {
     fake.restore()
   }
 })
 
-test('exchangeGeminiCode: an account without a project fails loud', async () => {
+test('setupGeminiProject: a free-tier account gets its project from onboarding', async () => {
+  // Regression: loadCodeAssist reports the tier but NOT the project, because
+  // the managed project does not exist until onboardUser creates it. Treating
+  // a known tier as "already provisioned" failed the login outright.
   const fake = fakeRoutes({
-    [GEMINI_TOKEN_URL]: { access_token: 'gem-at', refresh_token: 'gem-rt', expires_in: 3600 },
-    [LOAD_CODE_ASSIST_URL]: { currentTier: { id: 'standard-tier' }, cloudaicompanionProject: null },
-    [GEMINI_USERINFO_URL]: {},
+    [LOAD_CODE_ASSIST_URL]: {
+      currentTier: { id: 'free-tier', name: 'Gemini Code Assist for individuals' },
+      cloudaicompanionProject: null,
+    },
+    [ONBOARD_USER_URL]: { done: true, response: { cloudaicompanionProject: { id: 'provisioned-free' } } },
+  })
+  try {
+    const setup = await setupGeminiProject('gem-at', 1)
+    assert.equal(setup.projectId, 'provisioned-free')
+    assert.equal(setup.tier, 'free-tier')
+    assert.equal(setup.tierName, 'Gemini Code Assist for individuals')
+    const onboard = fake.seen.find(request => request.url === ONBOARD_USER_URL)
+    assert.ok(onboard !== undefined, 'onboarding ran even though the tier was already known')
+    const body = JSON.parse(onboard.body ?? '{}') as Record<string, unknown>
+    assert.equal(body.tierId, 'free-tier')
+    assert.equal(
+      body.cloudaicompanionProject, undefined,
+      'the free tier sends no project: the server provisions one',
+    )
+  } finally {
+    fake.restore()
+  }
+})
+
+test('setupGeminiProject: a tier that demands its own project fails loud', async () => {
+  const fake = fakeRoutes({
+    [LOAD_CODE_ASSIST_URL]: {
+      currentTier: { id: 'standard-tier', name: 'Standard', userDefinedCloudaicompanionProject: true },
+      cloudaicompanionProject: null,
+    },
   })
   try {
     await assert.rejects(
-      exchangeGeminiCode('the-code', 'the-verifier', 'http://127.0.0.1:1/oauth2callback'),
-      (error: unknown) => error instanceof GeminiProjectRequiredError,
+      setupGeminiProject('gem-at', 1),
+      (error: unknown) => error instanceof GeminiProjectRequiredError
+        && /GOOGLE_CLOUD_PROJECT/.test(error.message),
+    )
+    assert.equal(
+      fake.seen.some(request => request.url === ONBOARD_USER_URL), false,
+      'onboarding is not attempted without the project the tier requires',
     )
   } finally {
+    fake.restore()
+  }
+})
+
+test('setupGeminiProject: GOOGLE_CLOUD_PROJECT supplies the project a paid tier needs', async () => {
+  const fake = fakeRoutes({
+    [LOAD_CODE_ASSIST_URL]: {
+      currentTier: { id: 'standard-tier', name: 'Standard', userDefinedCloudaicompanionProject: true },
+      cloudaicompanionProject: null,
+    },
+    [ONBOARD_USER_URL]: { done: true, response: { cloudaicompanionProject: { id: 'my-gcp-project' } } },
+  })
+  const previous = process.env.GOOGLE_CLOUD_PROJECT
+  process.env.GOOGLE_CLOUD_PROJECT = 'my-gcp-project'
+  try {
+    const setup = await setupGeminiProject('gem-at', 1)
+    assert.equal(setup.projectId, 'my-gcp-project')
+    // It rides both calls: loadCodeAssist scopes the lookup, onboardUser enrolls it.
+    for (const url of [LOAD_CODE_ASSIST_URL, ONBOARD_USER_URL]) {
+      const request = fake.seen.find(entry => entry.url === url)
+      const body = JSON.parse(request?.body ?? '{}') as Record<string, unknown>
+      assert.equal(body.cloudaicompanionProject, 'my-gcp-project', `${url} carried the configured project`)
+    }
+  } finally {
+    if (previous === undefined) delete process.env.GOOGLE_CLOUD_PROJECT
+    else process.env.GOOGLE_CLOUD_PROJECT = previous
     fake.restore()
   }
 })

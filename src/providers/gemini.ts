@@ -71,7 +71,7 @@ export const GEMINI_SETUP_TIMEOUT_MS = 30_000
 /** Wall-clock ceiling for the whole onboarding poll, across all attempts. */
 export const GEMINI_ONBOARD_DEADLINE_MS = 120_000
 /** Gap between onboarding polls, matching the Gemini CLI's cadence. */
-const GEMINI_ONBOARD_POLL_MS = 5_000
+export const GEMINI_ONBOARD_POLL_MS = 5_000
 
 /** Code Assist method URL: `${version}:${method}` on the endpoint. */
 function codeAssistUrl(method: string): string {
@@ -123,6 +123,12 @@ interface GeminiUserTier {
   id?: string
   name?: string
   isDefault?: boolean
+  /**
+   * True on tiers that make the user bring their own Cloud project (the paid
+   * standard/enterprise tiers). The free tier leaves it false and gets a
+   * managed project provisioned by `onboardUser` instead.
+   */
+  userDefinedCloudaicompanionProject?: boolean
 }
 
 /** loadCodeAssist response shape (subset). */
@@ -135,7 +141,6 @@ interface LoadCodeAssistResponse {
 
 /** onboardUser long-running operation shape (subset). */
 interface GeminiOperation {
-  name?: string
   done?: boolean
   response?: { cloudaicompanionProject?: { id?: string } }
 }
@@ -147,12 +152,16 @@ export interface GeminiSetup {
   tierName?: string
 }
 
-/** Thrown when the account has no Code Assist project and needs one configured. */
+/**
+ * Thrown when the account's Code Assist tier requires a Cloud project the user
+ * has to supply, and none was found. Only the paid tiers do; the free tier
+ * gets a managed project provisioned during onboarding.
+ */
 export class GeminiProjectRequiredError extends Error {
-  constructor() {
+  constructor(tier?: string) {
     super(
-      'this Google account has no managed Gemini Code Assist project; set up a '
-      + 'Google Cloud project with the Gemini CLI (GOOGLE_CLOUD_PROJECT) first',
+      `this Google account's Gemini Code Assist tier${tier === undefined ? '' : ` (${tier})`} requires its own `
+      + 'Google Cloud project; set GOOGLE_CLOUD_PROJECT to the project id before logging in',
     )
     this.name = 'GeminiProjectRequiredError'
   }
@@ -174,22 +183,35 @@ async function codeAssistPost<T>(accessToken: string, method: string, body: unkn
   return response.json() as Promise<T>
 }
 
+/** The tier onboarding should enroll into: the current one, else the server's default. */
+function onboardTier(loaded: LoadCodeAssistResponse): GeminiUserTier {
+  if (loaded.currentTier !== undefined && loaded.currentTier !== null) return loaded.currentTier
+  return (loaded.allowedTiers ?? []).find(tier => tier.isDefault === true) ?? { id: 'legacy-tier' }
+}
+
 /**
- * Poll one long-running onboarding operation until it reports done, bounded by
- * a wall-clock deadline so a stuck operation cannot pin the login open.
+ * Run onboarding to completion. `onboardUser` is a long-running operation, and
+ * the way to await it is to re-issue the same call until it reports `done` —
+ * there is no operations endpoint to GET. Bounded by a wall-clock deadline so
+ * a stuck provision cannot pin the login open.
  */
-async function awaitGeminiOperation(accessToken: string, name: string): Promise<GeminiOperation> {
-  // Onboarding provisions the managed project; the CLI polls on a 5s cadence.
-  // The first poll runs immediately: most operations settle within a beat.
+async function onboardGeminiUser(
+  accessToken: string,
+  tierId: string,
+  projectId: string | undefined,
+  pollMs: number,
+): Promise<GeminiOperation> {
+  const request = {
+    tierId,
+    // Absent for the free tier, whose project is server-provisioned; present
+    // when the user supplied one, which the paid tiers require.
+    ...projectId === undefined ? {} : { cloudaicompanionProject: projectId },
+    metadata: CODE_ASSIST_METADATA,
+  }
   const deadline = Date.now() + GEMINI_ONBOARD_DEADLINE_MS
   for (let attempt = 0; Date.now() < deadline; attempt++) {
-    if (attempt > 0) await new Promise(resolve => setTimeout(resolve, GEMINI_ONBOARD_POLL_MS))
-    const response = await fetch(`${CODE_ASSIST_ENDPOINT}/${CODE_ASSIST_API_VERSION}/${name}`, {
-      headers: { authorization: `Bearer ${accessToken}`, ...attributionHeaders() },
-      signal: AbortSignal.timeout(GEMINI_SETUP_TIMEOUT_MS),
-    })
-    if (!response.ok) throw await oauthEndpointError(response, 'gemini onboarding')
-    const operation = await response.json() as GeminiOperation
+    if (attempt > 0) await new Promise(resolve => setTimeout(resolve, pollMs))
+    const operation = await codeAssistPost<GeminiOperation>(accessToken, 'onboardUser', request)
     if (operation.done === true) return operation
   }
   throw new Error('gemini onboarding did not finish in time; try logging in again')
@@ -197,45 +219,45 @@ async function awaitGeminiOperation(accessToken: string, name: string): Promise<
 
 /**
  * Resolve the Code Assist project and tier for a fresh login (gemini-cli's
- * setupUser): load the account's Code Assist state, and when the account has
- * never onboarded, enroll it in the server-proposed default tier and await
- * the provisioning operation.
+ * setupUser). Onboarding runs on EVERY login, not just the first: for the free
+ * tier the managed project is materialized by `onboardUser` and is not present
+ * in the `loadCodeAssist` response, so short-circuiting on a known tier leaves
+ * the project unresolved. `GOOGLE_CLOUD_PROJECT` overrides throughout, which is
+ * how a paid tier supplies the project it requires.
  * @param accessToken - the just-issued access token.
+ * @param pollMs - gap between onboarding polls; injectable for tests.
  * @returns the project id every generate request must carry, plus the tier.
  */
-export async function setupGeminiProject(accessToken: string): Promise<GeminiSetup> {
+export async function setupGeminiProject(
+  accessToken: string,
+  pollMs = GEMINI_ONBOARD_POLL_MS,
+): Promise<GeminiSetup> {
+  const configured = process.env.GOOGLE_CLOUD_PROJECT
+  let projectId = configured !== undefined && configured.length > 0 ? configured : undefined
   const loaded = await codeAssistPost<LoadCodeAssistResponse>(accessToken, 'loadCodeAssist', {
+    ...projectId === undefined ? {} : { cloudaicompanionProject: projectId },
     metadata: CODE_ASSIST_METADATA,
   })
-  if (loaded.currentTier !== undefined && loaded.currentTier !== null) {
-    const tier = loaded.paidTier?.id ?? loaded.currentTier.id
-    const tierName = loaded.paidTier?.name ?? loaded.currentTier.name
-    if (typeof loaded.cloudaicompanionProject !== 'string' || loaded.cloudaicompanionProject.length === 0) {
-      throw new GeminiProjectRequiredError()
-    }
-    return {
-      projectId: loaded.cloudaicompanionProject,
-      ...tier === undefined ? {} : { tier },
-      ...tierName === undefined ? {} : { tierName },
-    }
+  if (projectId === undefined
+    && typeof loaded.cloudaicompanionProject === 'string'
+    && loaded.cloudaicompanionProject.length > 0) {
+    projectId = loaded.cloudaicompanionProject
   }
-  const defaultTier = (loaded.allowedTiers ?? []).find(tier => tier.isDefault === true)
-  const tierId = defaultTier?.id ?? 'legacy-tier'
-  // `cloudaicompanionProject` is deliberately absent: the free tier provisions
-  // a managed project, and sending one errors out.
-  const operation = await codeAssistPost<GeminiOperation>(accessToken, 'onboardUser', {
-    tierId,
-    metadata: CODE_ASSIST_METADATA,
-  })
-  const settled = operation.done === true || operation.name === undefined
-    ? operation
-    : await awaitGeminiOperation(accessToken, operation.name)
-  const projectId = settled.response?.cloudaicompanionProject?.id
-  if (projectId === undefined || projectId.length === 0) throw new GeminiProjectRequiredError()
+  const tier = loaded.paidTier ?? onboardTier(loaded)
+  const tierId = tier.id ?? 'legacy-tier'
+  // Only the tiers that make the user bring a project can fail here; the free
+  // tier gets one provisioned below.
+  if (tier.userDefinedCloudaicompanionProject === true && projectId === undefined) {
+    throw new GeminiProjectRequiredError(tier.name ?? tierId)
+  }
+  const settled = await onboardGeminiUser(accessToken, tierId, projectId, pollMs)
+  const provisioned = settled.response?.cloudaicompanionProject?.id
+  const resolved = provisioned !== undefined && provisioned.length > 0 ? provisioned : projectId
+  if (resolved === undefined || resolved.length === 0) throw new GeminiProjectRequiredError(tier.name ?? tierId)
   return {
-    projectId,
+    projectId: resolved,
     tier: tierId,
-    ...defaultTier?.name === undefined ? {} : { tierName: defaultTier.name },
+    ...tier.name === undefined ? {} : { tierName: tier.name },
   }
 }
 
