@@ -1,6 +1,6 @@
 /**
  * dsh-plugin-subscriptions: register OAuth-subscription LLM providers
- * (ChatGPT/Codex, Claude, Grok) on `ctx.llm`, and expose the `/subscriptions-auth`
+ * (ChatGPT/Codex, Claude, Grok, Gemini) on `ctx.llm`, and expose the `/subscriptions-auth`
  * RPC channel the web Settings page uses to run the logins. The token store
  * lives at `~/.dsh/plugins/subscriptions/auth.json`; the channel registers only when
  * a host `connection` service exists, so headless compositions load fine.
@@ -36,6 +36,7 @@ import {
 import type {
   ClaudeSession,
   CodexSession,
+  GeminiSession,
   GrokSession,
   ProviderId,
   SessionMap,
@@ -72,13 +73,22 @@ import {
   isGrokPermanentRefreshError,
   refreshGrok,
 } from './providers/grok.js'
+import {
+  GeminiAdapter,
+  geminiFlow,
+  GEMINI_PREEMPT_MS,
+  exchangeGeminiCode,
+  fetchGeminiUsage,
+  isGeminiPermanentRefreshError,
+  refreshGemini,
+} from './providers/gemini.js'
 import { createXSearchTool } from './tools/x-search.js'
 import { createImageGenerateTool } from './tools/image-generate.js'
 import { createVideoGenerateTool, videosDirectory } from './tools/video-generate.js'
 
 export type { ModelEntry, ProviderUsage, UsageWindow } from './providers/common.js'
 export type { ProviderStatus } from './auth/rpc.js'
-export type { ClaudeSession, CodexSession, GrokSession, ProviderId } from './auth/store.js'
+export type { ClaudeSession, CodexSession, GeminiSession, GrokSession, ProviderId } from './auth/store.js'
 
 export const name = 'dsh-plugin-subscriptions'
 export const inject = ['llm']
@@ -88,7 +98,7 @@ export const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 300_000
 
 /** Plugin config, validated by the same-named schemastery schema. */
 export interface Config {
-  /** Provider routes to register; defaults to all three. */
+  /** Provider routes to register; defaults to all four. */
   providers?: ProviderId[]
   /** Maximum provider idle time while one stream read is outstanding (default five minutes). */
   streamIdleTimeoutMs?: number
@@ -97,10 +107,11 @@ export interface Config {
     codex?: ModelEntry[]
     claude?: ModelEntry[]
     grok?: ModelEntry[]
+    gemini?: ModelEntry[]
   }
 }
 
-const providerIdSchema = z.union(['codex', 'claude', 'grok'])
+const providerIdSchema = z.union(['codex', 'claude', 'grok', 'gemini'])
 const modelEntrySchema: z<ModelEntry> = z.object({
   id: z.string().required(),
   name: z.string(),
@@ -110,12 +121,13 @@ const modelEntrySchema: z<ModelEntry> = z.object({
 })
 
 export const Config: z<Config> = z.object({
-  providers: z.array(providerIdSchema).default(['codex', 'claude', 'grok']),
+  providers: z.array(providerIdSchema).default(['codex', 'claude', 'grok', 'gemini']),
   streamIdleTimeoutMs: z.number().min(1).default(DEFAULT_STREAM_IDLE_TIMEOUT_MS),
   models: z.object({
     codex: z.array(modelEntrySchema),
     claude: z.array(modelEntrySchema),
     grok: z.array(modelEntrySchema),
+    gemini: z.array(modelEntrySchema),
   }),
 })
 
@@ -137,6 +149,13 @@ const DEFAULT_MODELS: Record<ProviderId, ModelEntry[]> = {
     { id: 'grok-4-fast-reasoning', name: 'Grok 4 Fast Reasoning' },
     { id: 'grok-code-fast-1', name: 'Grok Code Fast 1' },
   ],
+  gemini: [
+    { id: 'gemini-3-pro-preview', name: 'Gemini 3 Pro Preview', maxTokens: 65_536, contextWindow: 1_000_000 },
+    { id: 'gemini-3-flash-preview', name: 'Gemini 3 Flash Preview', maxTokens: 65_536, contextWindow: 1_000_000 },
+    { id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro', maxTokens: 65_536, contextWindow: 1_000_000 },
+    { id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash', maxTokens: 65_536, contextWindow: 1_000_000 },
+    { id: 'gemini-2.5-flash-lite', name: 'Gemini 2.5 Flash Lite', maxTokens: 65_536, contextWindow: 1_000_000 },
+  ],
 }
 
 /** Validate and detach the model catalog for every provider. */
@@ -148,7 +167,12 @@ function resolveCatalog(models: Config['models']): Record<ProviderId, ModelEntry
     const entries = configured !== undefined && configured.length > 0 ? configured : DEFAULT_MODELS[provider]
     return validateModels(entries, `${name}: models.${provider}`)
   }
-  return { codex: resolve('codex'), claude: resolve('claude'), grok: resolve('grok') }
+  return {
+    codex: resolve('codex'),
+    claude: resolve('claude'),
+    grok: resolve('grok'),
+    gemini: resolve('gemini'),
+  }
 }
 
 /** The display account of a stored session, for the status endpoint. */
@@ -163,6 +187,7 @@ function accountOf(provider: ProviderId, session: StoredSession | undefined): st
     }
     case 'claude': return (session as ClaudeSession).emailAddress
     case 'grok': return (session as GrokSession).account
+    case 'gemini': return (session as GeminiSession).emailAddress
   }
 }
 
@@ -196,6 +221,16 @@ export class SubscriptionsAuthController implements AuthController {
    * cannot be read off the flow manager.
    */
   private claims = new Map<ProviderId, number>()
+
+  /**
+   * Token exchanges currently running, per provider. An attempt leaves the
+   * flow manager the moment its callback delivers the code, so `flows.isBusy`
+   * goes false while the exchange that follows can still run for seconds —
+   * gemini's first login provisions a Code Assist project and takes the
+   * longest. Counted rather than flagged so a superseded exchange finishing
+   * cannot clear the flag on the one that replaced it.
+   */
+  private exchanges = new Map<ProviderId, number>()
 
   constructor(
     private readonly flows: OAuthFlowManager,
@@ -242,7 +277,7 @@ export class SubscriptionsAuthController implements AuthController {
     const detail = this.lastError.get(provider)
     return {
       loggedIn: session !== undefined,
-      busy: this.flows.isBusy(provider),
+      busy: this.flows.isBusy(provider) || (this.exchanges.get(provider) ?? 0) > 0,
       ...session === undefined ? {} : { expiresAt: session.expiresAt },
       ...account === undefined ? {} : { account },
       ...detail === undefined ? {} : { detail },
@@ -270,7 +305,7 @@ export class SubscriptionsAuthController implements AuthController {
       this.completions.set('claude', this.complete('claude', attempt, this.claim('claude')))
       return { authorizeUrl: attempt.authorizeUrl }
     }
-    const spec = provider === 'grok' ? await grokFlow() : codexFlow
+    const spec = provider === 'grok' ? await grokFlow() : provider === 'gemini' ? geminiFlow : codexFlow
     const attempt = await this.flows.start(provider, spec)
     // Claimed only once the attempt exists: a rejected `start()` (one attempt
     // per provider) must not supersede the attempt already running.
@@ -296,8 +331,13 @@ export class SubscriptionsAuthController implements AuthController {
    * while `claim` still owns the provider's session.
    */
   private async complete(provider: ProviderId, attempt: OAuthAttempt, claim: number): Promise<void> {
+    let exchanging = false
     try {
       const code = await attempt.waitCode()
+      // From here the flow manager no longer reports this provider busy, but
+      // the login is still running: keep the card in its pending state.
+      this.exchanges.set(provider, (this.exchanges.get(provider) ?? 0) + 1)
+      exchanging = true
       const session = await this.exchange(provider, code, attempt)
       // Whoever claimed the session while the exchange ran owns it now, and
       // this result is stale. The check and the store call sit in one
@@ -321,6 +361,12 @@ export class SubscriptionsAuthController implements AuthController {
       if (!(error instanceof Error && error.message === 'login cancelled')) {
         this.lastError.set(provider, errorChain(error))
       }
+    } finally {
+      if (exchanging) {
+        const running = (this.exchanges.get(provider) ?? 1) - 1
+        if (running > 0) this.exchanges.set(provider, running)
+        else this.exchanges.delete(provider)
+      }
     }
   }
 
@@ -332,6 +378,8 @@ export class SubscriptionsAuthController implements AuthController {
         return exchangeClaudeCode(code, attempt.pkce.verifier, attempt.redirectUri, attempt.state)
       case 'grok':
         return exchangeGrokCode(code, attempt.pkce.verifier, attempt.redirectUri, attempt.pkce.challenge)
+      case 'gemini':
+        return exchangeGeminiCode(code, attempt.pkce.verifier, attempt.redirectUri)
     }
   }
 
@@ -341,6 +389,7 @@ export class SubscriptionsAuthController implements AuthController {
       case 'codex': return saveSession('codex', session as SessionMap['codex'] & object)
       case 'claude': return saveSession('claude', session as SessionMap['claude'] & object)
       case 'grok': return saveSession('grok', session as SessionMap['grok'] & object)
+      case 'gemini': return saveSession('gemini', session as SessionMap['gemini'] & object)
     }
   }
 
@@ -508,6 +557,28 @@ export function apply(ctx: Context, config: Config): void {
           // Durable catalog: capability metadata (reasoning efforts) survives
           // restarts, so a resumed session's selected effort keeps resolving.
           catalogStore: catalogStore('grok'),
+        })))
+        break
+      }
+      case 'gemini': {
+        const tokens = new TokenManager<GeminiSession>({
+          displayName: 'Gemini (Subscription)',
+          preemptMs: GEMINI_PREEMPT_MS,
+          load: () => getSession('gemini'),
+          save: session => saveSession('gemini', session),
+          remove: () => deleteSession('gemini'),
+          refresh: refreshGemini,
+          isPermanent: isGeminiPermanentRefreshError,
+          onRemoved: () => { authChanged('gemini') },
+        })
+        usageFetchers.gemini = async signal => fetchGeminiUsage(await tokens.session(), fetch, signal)
+        // Code Assist has no model-list endpoint: the catalog is the
+        // configured/static one, so there is no discovery to gate or persist.
+        handles.set('gemini', ctx.llm.registerAdapter(['gemini'], new GeminiAdapter({
+          models: catalog.gemini,
+          streamIdleTimeoutMs,
+          tokens,
+          resolveAttachments,
         })))
         break
       }

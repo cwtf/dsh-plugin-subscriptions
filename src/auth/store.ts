@@ -12,10 +12,10 @@ import { dirname } from 'node:path'
 import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
 
 /** Provider routes this plugin can serve. */
-export type ProviderId = 'codex' | 'claude' | 'grok'
+export type ProviderId = 'codex' | 'claude' | 'grok' | 'gemini'
 
 /** Every provider route, in display order. */
-export const PROVIDER_IDS: readonly ProviderId[] = ['codex', 'claude', 'grok']
+export const PROVIDER_IDS: readonly ProviderId[] = ['codex', 'claude', 'grok', 'gemini']
 
 /** Stored ChatGPT/Codex subscription session. */
 export interface CodexSession {
@@ -57,15 +57,35 @@ export interface GrokSession {
   account?: string
 }
 
+/** Stored Gemini (Google account / Gemini Code Assist) subscription session. */
+export interface GeminiSession {
+  accessToken: string
+  refreshToken: string
+  /** Epoch milliseconds at which the access token expires. */
+  expiresAt: number
+  /**
+   * Code Assist project id resolved by loadCodeAssist/onboardUser at login:
+   * the managed project for the free tier, or the account's configured one.
+   * Every generate request sends it as the envelope `project`.
+   */
+  projectId: string
+  /** User tier id reported at setup (e.g. `free-tier`, `standard-tier`). */
+  tier?: string
+  /** Display name of the tier reported at setup (e.g. `Gemini Code Assist for individuals`). */
+  tierName?: string
+  emailAddress?: string
+}
+
 /** The durable store shape: one optional session per provider. */
 export interface SessionMap {
   codex?: CodexSession
   claude?: ClaudeSession
   grok?: GrokSession
+  gemini?: GeminiSession
 }
 
 /** Any stored session, for provider-agnostic plumbing. */
-export type StoredSession = CodexSession | ClaudeSession | GrokSession
+export type StoredSession = CodexSession | ClaudeSession | GrokSession | GeminiSession
 
 /**
  * Absolute path of the auth store file.
@@ -91,6 +111,13 @@ function assertSessionShape(provider: ProviderId, value: unknown): asserts value
     || typeof entry.expiresAt !== 'number' || !Number.isFinite(entry.expiresAt)) {
     throw new Error(
       `subscriptions auth store: entry "${provider}" is missing accessToken/refreshToken/expiresAt; fix or delete the store file`,
+    )
+  }
+  // A gemini session without the Code Assist project resolved at login cannot
+  // serve a single request; refuse it here instead of at stream time.
+  if (provider === 'gemini' && (typeof entry.projectId !== 'string' || entry.projectId.length === 0)) {
+    throw new Error(
+      'subscriptions auth store: entry "gemini" is missing projectId; fix or delete the store file',
     )
   }
 }

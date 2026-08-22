@@ -380,7 +380,9 @@ test('login(claude): an import beats a token exchange that is still running', as
       // The code arrived, so the attempt is no longer pending — `cancel()` on
       // it is a no-op from here on, which is exactly why the guard exists.
       assert.equal(flows.pending('claude'), undefined, 'the attempt left the pending map')
-      assert.equal((await controller.status('claude')).busy, false)
+      // The flow manager is done, but the exchange it handed off to is not:
+      // the card stays pending so a login in flight never reads as idle.
+      assert.equal((await controller.status('claude')).busy, true)
 
       credentials = { ...FAKE_SESSION, accessToken: 'imported-cli' }
       await controller.login('claude')
@@ -527,7 +529,7 @@ test('auth RPC: status / login / cancel round trip', async () => {
 test('auth RPC: an unknown provider is rejected, not dispatched', async () => {
   await inIsolatedHome(async () => {
     const handler = await mountPlugin()
-    const result = await handler('login', { provider: 'gemini' }, signal())
+    const result = await handler('login', { provider: 'bogus' }, signal())
     assert.equal(result.ok, false)
     if (!result.ok) assert.equal(result.error.code, 'bad-request')
   })

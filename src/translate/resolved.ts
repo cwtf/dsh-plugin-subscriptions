@@ -7,7 +7,7 @@
  */
 
 import { LlmError } from '@deepseek-ai/dsh-llm'
-import type { ContentBlock, Message } from '@deepseek-ai/dsh-llm'
+import type { ContentBlock, Message, MessageSource } from '@deepseek-ai/dsh-llm'
 import type { AttachmentStore } from '@deepseek-ai/dsh-attachment'
 
 /** An image block with its bytes resolved to inline base64 for the wire. */
@@ -26,6 +26,13 @@ export type TranslatableBlock = ContentBlock | ResolvedImagePart
 export interface TranslatableMessage {
   role: 'system' | 'user' | 'assistant'
   content: readonly TranslatableBlock[]
+  /**
+   * The producing message's source, carried through unchanged. Translators
+   * that replay adapter-private state (`source.replayState` on a `model`
+   * source) read it; the rest ignore it. Optional so a hand-built message
+   * list stays valid input.
+   */
+  source?: MessageSource
 }
 
 /**
@@ -55,6 +62,8 @@ export async function resolveImages(
   }
   return Promise.all(messages.map(async (message): Promise<TranslatableMessage> => ({
     role: message.role,
+    // Carried through so replay-aware translators keep seeing `replayState`.
+    source: message.source,
     content: await Promise.all(message.content.map(async (block): Promise<TranslatableBlock> => {
       if (block.type !== 'image') return block
       const stored = await attachments.readImage(block.attachment, signal)
